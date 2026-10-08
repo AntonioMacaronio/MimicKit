@@ -1,0 +1,3 @@
+# Feature specification only; this is not a simulated carry environment.
+num_disc_obs_steps: 16
+feature_schema: g1_box_smp_v2

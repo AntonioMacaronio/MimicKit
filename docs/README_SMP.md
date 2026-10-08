@@ -22,6 +22,9 @@ python mimickit/run.py --mode test --num_envs 4 --engine_config data/engines/isa
 
 ## Train New Priors
 
+For the G1–box interaction dataset on the `smp-reward` branch, see
+[the portable carry loader and feature contract](README_SMP_REWARD.md).
+
 A new prior can be trained with the following command:
 
 ```

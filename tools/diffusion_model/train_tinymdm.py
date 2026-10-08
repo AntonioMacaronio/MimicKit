@@ -12,8 +12,16 @@ import yaml
 
 import anim.motion as motion
 from learning.tinymdm.tinymdm_model import TinyMDMModel
-from motion_prior_dataset import MotionPriorData
 import util.logger as logger
+
+def build_dataset(config, device):
+    if config.get("dataset_type", "character") == "hoi":
+        from mimickit_smp.tinymdm_data import HOIMotionPriorData
+        return HOIMotionPriorData(config, device)
+    if config.get("dataset_type", "character") != "character":
+        raise ValueError("Unknown prior dataset_type")
+    from motion_prior_dataset import MotionPriorData
+    return MotionPriorData(config, device)
 
 def fixseed(seed):
     torch.backends.cudnn.benchmark = False
@@ -40,6 +48,10 @@ def generate(model, dataset, obs_space, config, device, out_motion_dir, enable_e
         gen_samples = model.sample(shape=obs_space.shape, batch_size=num_samples, device=device)
 
     gen_samples = model.unnormalize(gen_samples.reshape([num_samples, num_frames, -1]))
+
+    if hasattr(dataset, "save_generated_samples"):
+        dataset.save_generated_samples(gen_samples, out_motion_dir)
+        return
 
     for i, gen_sample in enumerate(gen_samples):
         frames = dataset.convert_sample_to_frames(gen_sample).detach().cpu().numpy()
@@ -69,7 +81,7 @@ def test(cfg_path, model_file, out_dir=None, num_samples=16, device="cuda"):
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(out_motion_dir, exist_ok=True)
 
-    dataset_env = MotionPriorData(config, device)
+    dataset_env = build_dataset(config, device)
     obs_space = dataset_env.get_obs_space()
     num_obs_steps = env_config["num_disc_obs_steps"]
     config["input_dim"] = obs_space.shape[-1]
@@ -91,6 +103,8 @@ def train(cfg_path, out_dir=None, device="cuda"):
     
     with open(cfg_path, "r") as stream:
         config = yaml.safe_load(stream)
+    if "seed" in config:
+        fixseed(config["seed"])
     
     env_file = config["env_config"]
     with open(env_file, "r") as stream:
@@ -117,13 +131,21 @@ def train(cfg_path, out_dir=None, device="cuda"):
     output_iter = config.get("output_iter", 2_000)
     grad_clip_norm = config.get("grad_clip_norm", 1.0)
 
-    dataset_env = MotionPriorData(config, device)
+    dataset_env = build_dataset(config, device)
     obs_space = dataset_env.get_obs_space()
     num_obs_steps = env_config["num_disc_obs_steps"]
     
     config["input_dim"] = obs_space.shape[-1]
     config["input_channel"] = int(config["input_dim"] / num_obs_steps)
     print(f"Input_channel: {config['input_channel']}")
+
+    # Persist the resolved feature dimensions and HOI schema with the checkpoint.
+    if hasattr(dataset_env, "schema"):
+        config["feature_schema_sha256"] = dataset_env.schema.sha256
+    with open(out_config_file, "w") as stream:
+        yaml.safe_dump(config, stream)
+    if hasattr(dataset_env, "save_metadata"):
+        dataset_env.save_metadata(out_dir)
 
     samples = dataset_env.fetch_obs_demo(num_samples_stat)
     model = TinyMDMModel(config, device)

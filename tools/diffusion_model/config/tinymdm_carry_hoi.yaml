@@ -1,0 +1,26 @@
+model_name: tiny_mdm
+arch_name: DiT  # One class (carry); class_id=0 is retained in the dataset.
+T: 50
+loss_type: l1
+estimate_mode: epsilon
+noise_schedule_mode: squaredcos_cap_v2
+num_layers: 2
+num_attention_heads: 4
+model_ema: true
+model_ema_decay: 0.995
+model_ema_steps: 10
+model_ema_update_after: 5000
+normalizer_std_clip: 0.03
+batch_size: 512
+lr: 0.0002
+num_iterations: 200000
+num_samples_stat: 20000
+output_iter: 2000
+grad_clip_norm: 1.0
+seed: 0
+dataset_type: hoi
+data_device: cpu  # Packed states reside here; encoding runs on the model device.
+dataset_index: ${SMP_CARRY_DATASET}
+quality_policy: all  # All 780 selected segments; preserves pending-review metadata.
+env_config: tools/diffusion_model/config/carry_hoi_env.yaml
+control_freq: 50
