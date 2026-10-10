@@ -16,7 +16,11 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
+from . import quality
 from .features import KEY_BODIES, FeatureSchema
+
+# Source phases kept per policy: 0 pickup context, 1 lifted, 2 set-down context.
+WINDOW_POLICIES = {"lifted": (1,), "segment": (0, 1, 2)}
 
 
 def file_hash(path):
@@ -59,19 +63,30 @@ def slerp_wxyz(times, quats, query):
 
 
 def resample_positive(qpos, times, phase, object_center, sample_rate=50.0):
-    """Interpolation and backward velocities use only the contiguous lifted phase.
+    """Resample only the contiguous lifted phase (the "lifted" window policy)."""
+    return resample_interval(qpos, times, phase, object_center, sample_rate, WINDOW_POLICIES["lifted"])
 
-    Drop the first resampled state: its velocity has no preceding positive sample.
+
+def resample_interval(qpos, times, phase, object_center, sample_rate=50.0, phases=(1,), flags=None):
+    """Interpolation and backward velocities use only the contiguous selected phases.
+
+    Drop the first resampled state: its velocity has no preceding selected sample.
     No padding, wrapping, extrapolation, or future differences are introduced.
+    Each resampled state keeps the phase of the latest native frame at or before it.
+    Optional native quality flags pass to every state that interpolates, or takes
+    its velocity from, a flagged frame.
     """
-    qpos, times = np.asarray(qpos), np.asarray(times, np.float64)
+    qpos, times, phase = np.asarray(qpos), np.asarray(times, np.float64), np.asarray(phase)
     if qpos.shape != (len(times), 43) or not np.isfinite(qpos).all():
         raise ValueError("Expected finite root+29-joint+box states")
     if not np.isfinite(times).all() or np.any(np.diff(times) <= 0) or len(phase) != len(times):
         raise ValueError("Invalid source clock or phases")
-    ids = np.flatnonzero(np.asarray(phase) == 1)
+    ids = np.flatnonzero(np.isin(phase, phases))
     if len(ids) < 3 or not np.array_equal(ids, np.arange(ids[0], ids[-1] + 1)):
-        raise ValueError("Expected one contiguous lifted interval")
+        raise ValueError("Expected one contiguous interval of the selected phases")
+    lifted = np.flatnonzero(phase == 1)
+    if not len(lifted):
+        raise ValueError("Expected a lifted interval")
     q, t = qpos[ids], times[ids]
     count = int(np.floor((t[-1] - t[0]) * sample_rate + 1e-9)) + 1
     query = t[0] + np.arange(count) / sample_rate
@@ -88,6 +103,11 @@ def resample_positive(qpos, times, phase, object_center, sample_rate=50.0):
     def angular(rot):
         return (rot[1:] * rot[:-1].inv()).as_rotvec() * sample_rate
 
+    query_phase = phase[ids][np.searchsorted(t, query, side="right") - 1]
+    extra = {}
+    if flags is not None:
+        bracket = quality.resample_flags(np.asarray(flags, np.uint8)[ids], t, query)
+        extra["quality_flags"] = bracket[1:] | bracket[:-1]
     return {
         "time": query[1:],
         "root_pos": root_pos[1:],
@@ -99,11 +119,14 @@ def resample_positive(qpos, times, phase, object_center, sample_rate=50.0):
         "box_quat": box_rot.as_quat()[1:, [3, 0, 1, 2]],
         "box_vel": np.diff(box_pos, axis=0) * sample_rate,
         "box_ang_vel": angular(box_rot),
-        "positive_time_bounds": [float(t[0]), float(t[-1])],
+        "phase": query_phase[1:],
+        "positive_time_bounds": [float(times[lifted[0]]), float(times[lifted[-1]])],
+        "interval_time_bounds": [float(t[0]), float(t[-1])],
+        **extra,
     }
 
 
-def process_segment(segment, output, schema_dict):
+def process_segment(segment, output, schema_dict, window_policy="lifted"):
     import mujoco
 
     schema = FeatureSchema.from_dict(schema_dict)
@@ -130,8 +153,17 @@ def process_segment(segment, output, schema_dict):
             raise ValueError("Object dimension metadata mismatch")
         if not np.allclose(np.diff(d["source_timestamps"]), 1 / float(d["fps"]), atol=1e-7, rtol=0):
             raise ValueError("Invalid native sampling rate")
-        values = resample_positive(
-            d["qpos"], d["source_timestamps"], d["phase"], center, schema.sample_rate_hz
+        native_flags, _ = quality.frame_flags(
+            d["qpos"], float(d["fps"]), str(d["scene_xml"]), d["human_joints"], d["human_joint_names"]
+        )
+        values = resample_interval(
+            d["qpos"],
+            d["source_timestamps"],
+            d["phase"],
+            center,
+            schema.sample_rate_hz,
+            WINDOW_POLICIES[window_policy],
+            native_flags,
         )
     model = mujoco.MjModel.from_xml_string(skeleton)
     names = tuple(
@@ -163,6 +195,12 @@ def process_segment(segment, output, schema_dict):
         raise ValueError("Unsafe segment ID")
     destination = output / "states" / (name + ".npy")
     np.save(destination, states, allow_pickle=False)
+    flags_path = output / "quality" / (name + ".npy")
+    np.save(flags_path, values["quality_flags"], allow_pickle=False)
+    lifted = np.flatnonzero(values["phase"] == 1)
+    if not len(lifted) or not np.array_equal(lifted, np.arange(lifted[0], lifted[-1] + 1)):
+        raise ValueError("Resampled lift is not one contiguous interval")
+    lift_bounds = [int(lifted[0]), int(lifted[-1]) + 1]
     return {
         **{
             k: segment[k]
@@ -181,11 +219,24 @@ def process_segment(segment, output, schema_dict):
         "class_name": "carry",
         "states": str(destination.relative_to(output)),
         "states_sha256": file_hash(destination),
+        "quality_flags": str(flags_path.relative_to(output)),
+        "quality_flags_sha256": file_hash(flags_path),
+        "quality_flagged_states": {
+            check: int(np.count_nonzero(values["quality_flags"] & bit)) for check, bit in quality.BITS.items()
+        },
+        "quality_flagged_native_frames": {
+            check: int(np.count_nonzero(native_flags & bit)) for check, bit in quality.BITS.items()
+        },
         "frames": count,
         "valid_windows": count - schema.window_frames + 1,
+        "window_policy": window_policy,
+        "lift_index_bounds": lift_bounds,
+        "lifted_windows": max(0, lift_bounds[1] - lift_bounds[0] - schema.window_frames + 1),
+        "phase_frames": {str(k): int((values["phase"] == k).sum()) for k in (0, 1, 2)},
         "source_time_start": float(values["time"][0]),
         "source_time_end": float(values["time"][-1]),
         "source_positive_time_bounds": values["positive_time_bounds"],
+        "source_interval_time_bounds": values["interval_time_bounds"],
         "source_trajectory": str(path),
         "source_trajectory_sha256": segment["trajectory_sha256"],
         "box_local_center_offset_m": center.tolist(),
@@ -193,9 +244,11 @@ def process_segment(segment, output, schema_dict):
     }
 
 
-def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16):
+def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16, window_policy="lifted"):
     import mujoco
 
+    if window_policy not in WINDOW_POLICIES:
+        raise ValueError(f"window_policy must be one of {sorted(WINDOW_POLICIES)}")
     manifest_path, output = Path(manifest_path).resolve(), Path(output).resolve()
     manifest = json.loads(manifest_path.read_text())
     if manifest["status"] != "complete":
@@ -219,12 +272,16 @@ def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16
     )
     output.mkdir(parents=True, exist_ok=False)
     (output / "states").mkdir()
+    (output / "quality").mkdir()
     (output / "robot_kinematics.xml").write_text(skeleton)
     save_json(output / "source_manifest.json", manifest)
     save_json(output / "status.json", {"status": "preparing", "pid": os.getpid(), "requested": len(segments)})
     results, failures = [], []
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(process_segment, s, output, schema.to_dict()): s["trial_id"] for s in segments}
+        futures = {
+            pool.submit(process_segment, s, output, schema.to_dict(), window_policy): s["trial_id"]
+            for s in segments
+        }
         for future in as_completed(futures):
             trial = futures[future]
             try:
@@ -252,8 +309,16 @@ def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16
         "feature_schema_sha256": schema.sha256,
         "source_manifest_sha256": file_hash(manifest_path),
         "class_map": {"carry": 0},
+        "window_policy": window_policy,
         "sampling": "uniform_valid_window_starts",
         "quality_policy": "all_selected_flags_preserved",
+        "quality_checks": {
+            "names": list(quality.CHECKS),
+            "bits": quality.BITS,
+            "thresholds": quality.THRESHOLDS,
+            "scope": "Per-state bit flags; the dataset drops windows touching a selected check",
+            "code_sha256": file_hash(quality.__file__),
+        },
         "training_approval": "pending_retarget_review",
         "segments": results,
         "failures": failures,
@@ -261,6 +326,10 @@ def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16
             "segments": len(results),
             "states": sum(s["frames"] for s in results),
             "windows": sum(s["valid_windows"] for s in results),
+            "lifted_windows": sum(s["lifted_windows"] for s in results),
+            "quality_flagged_states": {
+                check: sum(s["quality_flagged_states"][check] for s in results) for check in quality.CHECKS
+            },
             "split_segments": dict(Counter(s["split"] for s in results)),
             "quality_counts": dict(Counter(s["quality_status"] for s in results)),
         },
@@ -269,6 +338,7 @@ def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16
             "numpy": np.__version__,
             "mujoco": mujoco.__version__,
             "source_resampling": "linear_positions_joints_shortest_arc_slerp",
+            "window_policy_phases": list(WINDOW_POLICIES[window_policy]),
         },
     }
     save_json(output / "index.json", index)
@@ -286,10 +356,18 @@ def main():
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--sample-rate", type=float, default=50.0)
     parser.add_argument("--window-frames", type=int, default=16)
+    parser.add_argument(
+        "--window-policy",
+        choices=sorted(WINDOW_POLICIES),
+        default="lifted",
+        help="lifted: lifted interval only; segment: also pickup and set-down context",
+    )
     args = parser.parse_args()
     if not 1 <= args.workers <= 32:
         parser.error("Use 1 to 32 workers")
-    prepare(args.manifest, args.output, args.workers, args.sample_rate, args.window_frames)
+    prepare(
+        args.manifest, args.output, args.workers, args.sample_rate, args.window_frames, args.window_policy
+    )
 
 
 if __name__ == "__main__":

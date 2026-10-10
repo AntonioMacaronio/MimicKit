@@ -6,7 +6,7 @@ import torch
 from scipy.spatial.transform import Rotation
 
 from mimickit_smp.dataset import CarryWindowDataset, make_dataloader
-from mimickit_smp.features import FeatureSchema, encode_motion, quat_mul, quat_rotate
+from mimickit_smp.features import FeatureSchema, encode_motion, encode_window, quat_mul, quat_rotate
 from mimickit_smp.normalization import FeatureNormalizer, fit_normalizer
 from mimickit_smp.prepare import resample_positive
 
@@ -33,13 +33,15 @@ def test_window_timing_and_feature_conventions():
     s, x = schema(), states()
     assert s.span_seconds == 0.3
     assert (10 - 1) / 30 == s.span_seconds
-    out = encode_motion(x, s)
-    assert out.shape == (16, 219)
+    out, box_size = encode_window(x, s)
+    assert out.shape == (16, 216) and s.feature_dim == 216 and s.condition_dim == 3
     torch.testing.assert_close(out[:, 0], x[:, 0] - 0.3)
     torch.testing.assert_close(out[:, 2], x[:, 2])
     torch.testing.assert_close(out[:, 195], torch.ones(16))
     torch.testing.assert_close(out[:, 201] - out[:, 0], torch.full((16,), 0.4))
-    torch.testing.assert_close(out[:, 216:219], x[:, 67:70])
+    # Identity box: canonical X/Y/Z are the mesh axes, so the condition is the input extents.
+    torch.testing.assert_close(box_size, x[-1, 67:70])
+    torch.testing.assert_close(encode_motion(x, s), out)
 
 
 def test_shared_encoder_is_yaw_translation_invariant_but_object_sensitive():
@@ -132,7 +134,8 @@ def test_windows_split_boundaries_metadata_and_portability(tmp_path):
     with pytest.raises(IndexError):
         dataset[len(dataset)]
     batch = next(iter(make_dataloader(dataset, batch_size=8, shuffle=False)))
-    assert batch["motion"].shape == (8, 16, 219)
+    assert batch["motion"].shape == (8, 16, 216)
+    assert batch["box_size"].shape == (8, 3)
     assert batch["class_id"].tolist() == [0] * 8
     assert len(CarryWindowDataset(index, quality="unflagged")) == 3
     with pytest.raises(ValueError, match="No usable"):
@@ -178,7 +181,7 @@ def test_tinymdm_adapter_uses_train_split_and_checks_window_contract(tmp_path):
     config = {"dataset_index": str(index), "env_config": str(env), "control_freq": 50}
     adapter = HOIMotionPriorData(config, "cpu")
     obs, labels = adapter.fetch_obs_demo(5, return_class=True)
-    assert obs.shape == (5, 3504)
+    assert obs.shape == (5, 3456) and adapter.condition_dim == 3
     assert labels.tolist() == [0] * 5
     assert {s["split"] for s in adapter.dataset.segments} == {"train"}
     with pytest.raises(ValueError, match="frequency"):

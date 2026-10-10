@@ -4,7 +4,13 @@ import torch.nn as nn
 from typing import Any, Dict, List, Optional, Tuple
 from diffusers.configuration_utils import ConfigMixin
 
-from learning.tinymdm.modules import AdaLayerNormSingle, SinusoidalPositionalEmbedding, StableMotionDiTBlock
+from learning.tinymdm.modules import (
+    AdaLayerNormSingle,
+    ConditionEmbedding,
+    SinusoidalPositionalEmbedding,
+    StableMotionDiTBlock,
+    embed_condition,
+)
 
 class TinyStableMotionDiTModel(nn.Module, ConfigMixin):
     def __init__(
@@ -16,6 +22,7 @@ class TinyStableMotionDiTModel(nn.Module, ConfigMixin):
         out_channels: int = 64,
         dropout: float = 0.,
         max_seq_len: int = 32,
+        cond_dim: int = 0,
     ):
         super().__init__()
 
@@ -47,12 +54,15 @@ class TinyStableMotionDiTModel(nn.Module, ConfigMixin):
         self.proj_out = nn.Linear(self.inner_dim, self.out_channels, bias=False)
         self.postprocess_conv = nn.Conv1d(self.out_channels, self.out_channels, 1, bias=False)
         self.sequence_pos_encoder = SinusoidalPositionalEmbedding(self.inner_dim, max_seq_length=max_seq_len)
+        # Created last so models without a condition keep their parameter initialization.
+        self.cond_embedder = ConditionEmbedding(cond_dim, self.inner_dim) if cond_dim else None
 
     def forward(
         self,
         hidden_states: torch.FloatTensor,
         timestep: torch.LongTensor = None,
         attention_mask: Optional[torch.LongTensor] = None,
+        cond: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.FloatTensor:        
         batch_size = hidden_states.shape[0]
@@ -65,7 +75,8 @@ class TinyStableMotionDiTModel(nn.Module, ConfigMixin):
 
         hidden_states = self.proj_in(hidden_states)
 
-        time_hidden_states, embedded_timestep = self.adaln_single(timestep)
+        condition_embedding = embed_condition(self.cond_embedder, cond, batch_size)
+        time_hidden_states, embedded_timestep = self.adaln_single(timestep, condition_embedding=condition_embedding)
         
         # Add pos embedding
         hidden_states = self.sequence_pos_encoder(hidden_states)
@@ -105,6 +116,7 @@ class CondTinyStableMotionDiTModel(nn.Module, ConfigMixin):
         num_class: int = 0,
         cfg_dropout: float = 0.0, # Use dropout for CFG
         max_seq_len: int = 32,
+        cond_dim: int = 0,
     ):
         super().__init__()
 
@@ -139,6 +151,8 @@ class CondTinyStableMotionDiTModel(nn.Module, ConfigMixin):
         self.proj_out = nn.Linear(self.inner_dim, self.out_channels, bias=False)
         self.postprocess_conv = nn.Conv1d(self.out_channels, self.out_channels, 1, bias=False)
         self.sequence_pos_encoder = SinusoidalPositionalEmbedding(self.inner_dim, max_seq_length=max_seq_len)
+        # Created last so models without a condition keep their parameter initialization.
+        self.cond_embedder = ConditionEmbedding(cond_dim, self.inner_dim) if cond_dim else None
 
     def forward(
         self,
@@ -147,6 +161,7 @@ class CondTinyStableMotionDiTModel(nn.Module, ConfigMixin):
         global_hidden_states: torch.FloatTensor = None,
         attention_mask: Optional[torch.LongTensor] = None,
         class_labels: Optional[torch.LongTensor] = None,
+        cond: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.FloatTensor:
         batch_size = hidden_states.shape[0]
@@ -159,7 +174,10 @@ class CondTinyStableMotionDiTModel(nn.Module, ConfigMixin):
 
         hidden_states = self.proj_in(hidden_states)
         
-        time_hidden_states, embedded_timestep = self.adaln_single(timestep, class_labels, **kwargs)
+        condition_embedding = embed_condition(self.cond_embedder, cond, batch_size)
+        time_hidden_states, embedded_timestep = self.adaln_single(
+            timestep, class_labels, condition_embedding=condition_embedding, **kwargs
+        )
         
         # Add pos embedding
         hidden_states = self.sequence_pos_encoder(hidden_states)

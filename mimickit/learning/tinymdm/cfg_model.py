@@ -19,6 +19,9 @@ class ClassifierFreeSampleModel(nn.Module):
         else:
             class_labels_dummy = None
 
+        if kwargs.get("cond") is not None:
+            # Both halves see the same continuous condition; only the class is dropped.
+            kwargs["cond"] = torch.cat((kwargs["cond"], kwargs["cond"]), dim=0)
         kwargs["force_drop_ids"] = force_drop_ids
         out = self.model(x_dummy, timestep_dummy, class_labels=class_labels_dummy, **kwargs)
         cond_pred, uncond_pred = out.chunk(2, dim=0) 

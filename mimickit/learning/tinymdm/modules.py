@@ -71,11 +71,44 @@ class AdaLayerNormSingle(nn.Module):
         self,
         timestep: torch.Tensor,
         class_labels: Optional[torch.Tensor] = None,
+        condition_embedding: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # No modulation happening here.
         embedded_timestep = self.emb(timestep, class_cond=class_labels, **kwargs)
+        if condition_embedding is not None:
+            # A continuous condition (e.g. box size) joins the timestep/class embedding.
+            embedded_timestep = embedded_timestep + condition_embedding.unsqueeze(1)
         return self.linear(self.silu(embedded_timestep)), embedded_timestep
+
+
+class ConditionEmbedding(nn.Module):
+    """Embed a continuous, un-noised condition into the timestep embedding.
+
+    The output layer starts at zero, so a new conditional model initially matches
+    the unconditional one and learns how much the condition matters.
+    """
+
+    def __init__(self, cond_dim: int, embedding_dim: int):
+        super().__init__()
+        self.cond_dim = cond_dim
+        self.net = nn.Sequential(nn.Linear(cond_dim, embedding_dim), nn.SiLU(), nn.Linear(embedding_dim, embedding_dim))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, cond: torch.Tensor) -> torch.Tensor:
+        return self.net(cond)
+
+
+def embed_condition(embedder: Optional[ConditionEmbedding], cond: Optional[torch.Tensor], batch_size: int):
+    """Require a condition exactly when the model was built with one."""
+    if embedder is None:
+        if cond is not None:
+            raise ValueError("This model has no continuous condition input")
+        return None
+    if cond is None or tuple(cond.shape) != (batch_size, embedder.cond_dim):
+        raise ValueError(f"Expected a [{batch_size}, {embedder.cond_dim}] condition")
+    return embedder(cond)
 
 
 class PixArtAlphaCombinedTimestepModeEmbeddings(nn.Module):

@@ -32,6 +32,10 @@ class TinyMDMModel(KinematicBaseModel):
         self.schedule_mode = config["noise_schedule_mode"]
         self.arch_name = config["arch_name"]
         self.model_ema = config.get("model_ema", False)
+        # Continuous condition (e.g. box size) given to the denoiser without noise.
+        self.cond_dim = int(config.get("cond_dim", 0))
+        # Positional table length: the default 32 keeps older checkpoints loadable.
+        self.max_seq_len = max(32, self.num_disc_obs_steps)
         self.config = config
 
         if self.arch_name == "DiT":
@@ -45,6 +49,8 @@ class TinyMDMModel(KinematicBaseModel):
                 num_attention_heads=self.num_attention_heads,
                 out_channels=self.input_channel,
                 dropout=self.dropout,
+                cond_dim=self.cond_dim,
+                max_seq_len=self.max_seq_len,
             )
         elif self.arch_name == "CondDiT":
             print("Using CondDiT architecture")
@@ -59,6 +65,8 @@ class TinyMDMModel(KinematicBaseModel):
                 dropout=self.dropout,
                 num_class=config.get("num_class", 0),
                 cfg_dropout=config.get("cfg_dropout", 0.),
+                cond_dim=self.cond_dim,
+                max_seq_len=self.max_seq_len,
             )
         else:
             raise ValueError(f"Unknown architecture: {self.arch_name}")
@@ -99,7 +107,31 @@ class TinyMDMModel(KinematicBaseModel):
             dtype=self._obs_dtype,
             std_clip=self.config["normalizer_std_clip"],
         )
+        if self.cond_dim:
+            # Frozen with the checkpoint, like the motion normalizer.
+            self.cond_normalizer = Normalizer(
+                (self.cond_dim),
+                device=self._device,
+                dtype=self._obs_dtype,
+                std_clip=self.config.get("cond_std_clip", 1e-3),
+            )
         return
+
+    def update_cond_normalizer(self, cond):
+        self.cond_normalizer.record(cond.reshape(-1, self.cond_dim))
+        self.cond_normalizer.update()
+        return
+
+    def _with_condition(self, kwargs):
+        """Normalize a raw condition; require one exactly when the model has a condition input."""
+        cond = kwargs.get("cond")
+        if not self.cond_dim:
+            if cond is not None:
+                raise ValueError("This prior was trained without a continuous condition")
+            return kwargs
+        if cond is None or cond.shape[-1] != self.cond_dim:
+            raise ValueError(f"Expected a raw [batch, {self.cond_dim}] condition")
+        return {**kwargs, "cond": self.cond_normalizer.normalize(cond.reshape(-1, self.cond_dim))}
     
     def update_normalizer(self, samples):
         self.obs_normalizer.record(samples.reshape(-1, self.input_channel))
@@ -143,6 +175,7 @@ class TinyMDMModel(KinematicBaseModel):
         return x_0
 
     def forward(self, x, timesteps=None, **kwargs):
+        kwargs = self._with_condition(kwargs)
         bsz = x.shape[0]
         device = x.device
         if timesteps is None:
@@ -178,6 +211,7 @@ class TinyMDMModel(KinematicBaseModel):
     
     @torch.no_grad()
     def sample(self, shape, batch_size, device, sampler="ddpm", num_inference_steps=None, **kwargs):
+        kwargs = self._with_condition(kwargs)
         denoiser = self._get_sampling_denoiser(use_ema=False, cfg_scale=kwargs.get("cfg_scale", 1.0))
 
         if sampler == "ddpm":
@@ -196,6 +230,7 @@ class TinyMDMModel(KinematicBaseModel):
 
     @torch.no_grad()
     def sample_dump(self, shape, batch_size, device, **kwargs):
+        kwargs = self._with_condition(kwargs)
         if kwargs.get("cfg_scale", 1.) != 1:
             denoiser = ClassifierFreeSampleModel(self.dmodel)
         else:
@@ -213,6 +248,7 @@ class TinyMDMModel(KinematicBaseModel):
     
     @torch.no_grad()
     def sample_ema(self, shape, batch_size, device, sampler="ddpm", num_inference_steps=None, **kwargs):
+        kwargs = self._with_condition(kwargs)
         denoiser = self._get_sampling_denoiser(use_ema=True, cfg_scale=kwargs.get("cfg_scale", 1.0))
 
         if sampler == "ddpm":
@@ -236,6 +272,7 @@ class TinyMDMModel(KinematicBaseModel):
         t_lst = None,
         **kwargs,
     ) -> torch.Tensor:
+        kwargs = self._with_condition(kwargs)
         denoiser = self._get_sampling_denoiser(
             use_ema=self.model_ema,
             cfg_scale=kwargs.get("cfg_scale", 1.0),

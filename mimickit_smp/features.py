@@ -33,13 +33,17 @@ FEATURE_SLICES = {
     "box_angular_velocity": (213, 216),
     "box_full_extents": (216, 219),
 }
+# v3 removes box size from the denoised motion and passes it as a clean condition.
+FEATURE_SLICES_V3 = {k: v for k, v in FEATURE_SLICES.items() if k != "box_full_extents"}
+CONDITION_SLICES_V3 = {"box_size": (0, 3)}
 KEY_BODIES = (
     "left_ankle_roll_link",
     "right_ankle_roll_link",
     "left_rubber_hand_link",
     "right_rubber_hand_link",
 )
-CURRENT_FEATURE_VERSION = "g1_box_smp_v2"
+FEATURE_VERSIONS = ("g1_box_smp_v1", "g1_box_smp_v2", "g1_box_smp_v3")
+CURRENT_FEATURE_VERSION = "g1_box_smp_v3"
 BOX_AXIS_TIE_TOLERANCE = 1e-6
 
 
@@ -54,7 +58,7 @@ class FeatureSchema:
     version: str = CURRENT_FEATURE_VERSION
 
     def __post_init__(self):
-        if self.version not in ("g1_box_smp_v1", CURRENT_FEATURE_VERSION):
+        if self.version not in FEATURE_VERSIONS:
             raise ValueError("Unsupported feature schema version")
         if len(self.joint_names) != 29 or len(set(self.joint_names)) != 29:
             raise ValueError("Expected 29 unique, ordered G1 joints")
@@ -71,8 +75,17 @@ class FeatureSchema:
         return (self.window_frames - 1) / self.sample_rate_hz
 
     @property
+    def box_size_condition(self):
+        """v3 conditions on canonical box size instead of denoising it."""
+        return self.version == "g1_box_smp_v3"
+
+    @property
     def feature_dim(self):
-        return 219
+        return 216 if self.box_size_condition else 219
+
+    @property
+    def condition_dim(self):
+        return 3 if self.box_size_condition else 0
 
     def current_features(self):
         """Upgrade the encoding contract without modifying cached mesh-frame states."""
@@ -82,7 +95,7 @@ class FeatureSchema:
         data = asdict(self)
         data.update(
             state_slices=STATE_SLICES,
-            feature_slices=FEATURE_SLICES,
+            feature_slices=FEATURE_SLICES_V3 if self.box_size_condition else FEATURE_SLICES,
             frame_order="oldest_to_newest",
             units="meters_radians_seconds",
             up_axis="Z",
@@ -95,7 +108,7 @@ class FeatureSchema:
             velocity_convention="world_spatial_linear_and_angular_velocity_rotated_by_last_heading",
             source_velocity_estimator="backward_difference_at_target_rate",
         )
-        if self.version == CURRENT_FEATURE_VERSION:
+        if self.version != "g1_box_smp_v1":
             data.update(
                 box_input_axes="source_mesh_axes_with_matching_local_full_extents",
                 box_feature_axes="right_handed_Z_most_up_X_most_root_forward",
@@ -103,7 +116,13 @@ class FeatureSchema:
                 box_axis_mapping="one_signed_permutation_for_entire_window",
                 box_axis_tie_break="Z_then_X_then_Y_for_up_axis_X_then_Y_then_Z_for_forward_axis",
                 box_axis_tie_tolerance=BOX_AXIS_TIE_TOLERANCE,
-                box_feature_extents="input_extents_permuted_to_feature_X_Y_Z",
+            )
+        if self.version == "g1_box_smp_v2":
+            data.update(box_feature_extents="input_extents_permuted_to_feature_X_Y_Z")
+        if self.box_size_condition:
+            data.update(
+                condition_slices=CONDITION_SLICES_V3,
+                box_size_condition="canonical_X_Y_Z_full_extents_at_last_frame_not_noised",
             )
         return data
 
@@ -201,8 +220,13 @@ def canonical_box_axes(quats, extents):
     return torch.cat((x, z), -1), extents.gather(-1, order)
 
 
-def encode_motion(states: torch.Tensor, schema: FeatureSchema) -> torch.Tensor:
-    """Encode [..., H, 70] live or cached states into [..., H, 219] features.
+def encode_window(states: torch.Tensor, schema: FeatureSchema):
+    """Encode [..., H, 70] live or cached states into (motion, condition).
+
+    v3 returns [..., H, 216] motion features and a [..., 3] box-size condition:
+    canonical X (most forward), Y, Z (most up) full extents at the window's last
+    frame, which the prior receives without noise. v1/v2 return [..., H, 219]
+    features with the extents as denoised channels, and no condition.
 
     Caller maps named joints/body origins into schema order and supplies unit
     WXYZ quaternions, world-frame velocities, and full (not half) box extents.
@@ -230,19 +254,23 @@ def encode_motion(states: torch.Tensor, schema: FeatureSchema) -> torch.Tensor:
         box_rotation, box_extents = rotation_6d(box_quat), states[..., 67:70]
     else:
         box_rotation, box_extents = canonical_box_axes(box_quat, states[..., 67:70])
-    return torch.cat(
-        (
-            local_root,
-            rotation_6d(quat_mul(inv, q)),
-            rotation_6d(joint_q).flatten(-2),
-            key,
-            quat_rotate(inv, states[..., 48:51]),
-            quat_rotate(inv, states[..., 51:54]),
-            quat_rotate(inv, states[..., 54:57] - origin),
-            box_rotation,
-            quat_rotate(inv, states[..., 61:64]),
-            quat_rotate(inv, states[..., 64:67]),
-            box_extents,
-        ),
-        dim=-1,
-    )
+    motion = [
+        local_root,
+        rotation_6d(quat_mul(inv, q)),
+        rotation_6d(joint_q).flatten(-2),
+        key,
+        quat_rotate(inv, states[..., 48:51]),
+        quat_rotate(inv, states[..., 51:54]),
+        quat_rotate(inv, states[..., 54:57] - origin),
+        box_rotation,
+        quat_rotate(inv, states[..., 61:64]),
+        quat_rotate(inv, states[..., 64:67]),
+    ]
+    if schema.box_size_condition:
+        return torch.cat(motion, dim=-1), box_extents[..., -1, :]
+    return torch.cat([*motion, box_extents], dim=-1), None
+
+
+def encode_motion(states: torch.Tensor, schema: FeatureSchema) -> torch.Tensor:
+    """Motion features only; see encode_window for the box-size condition."""
+    return encode_window(states, schema)[0]

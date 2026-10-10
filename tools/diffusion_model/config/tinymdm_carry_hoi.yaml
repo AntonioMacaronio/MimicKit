@@ -22,5 +22,16 @@ dataset_type: hoi
 data_device: cpu  # Packed states reside here; encoding runs on the model device.
 dataset_index: ${SMP_CARRY_DATASET}
 quality_policy: all  # All 780 selected segments; preserves pending-review metadata.
+window_stages: all  # Pickup, lift and set-down windows, all class carry (a segment cache).
+# Drop windows touching a state flagged by these mimickit_smp.quality checks (needs a cache
+# prepared with quality flags). Grip type is never checked.
+quality_checks: [physical, chatter, foot_slide, support]
+# Draw windows by stage first; uniform within a stage. Unweighted, pickup and set-down
+# windows are only ~15% of the data. null samples uniformly over windows.
+stage_weights: {pickup: 0.2, lifted: 0.6, setdown: 0.2}
+# Schema v3 conditions on canonical box size (cond_dim 3, set by the dataset); not noised.
 env_config: tools/diffusion_model/config/carry_hoi_env.yaml
+validation_split: validation  # Held-out actors; logs fixed-noise denoising loss per stage.
+eval_windows: 4096  # Per split and stage (all, pickup, lifted, set-down).
+checkpoint_every: 20000
 control_freq: 50

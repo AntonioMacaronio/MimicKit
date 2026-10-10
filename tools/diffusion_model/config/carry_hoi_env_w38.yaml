@@ -1,0 +1,4 @@
+# Feature specification only; this is not a simulated carry environment.
+# 38 states at 50 Hz: a (38 - 1) / 50 = 0.74 s window.
+num_disc_obs_steps: 38
+feature_schema: g1_box_smp_v3

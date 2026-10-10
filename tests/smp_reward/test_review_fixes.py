@@ -133,7 +133,7 @@ def test_v1_cache_loads_unchanged_but_old_normalization_and_checkpoint_are_rejec
     before = index.read_bytes()
     dataset = CarryWindowDataset(index)
     assert dataset.cache_schema.sha256 == old.sha256
-    assert dataset.schema.version == "g1_box_smp_v2"
+    assert dataset.schema.version == "g1_box_smp_v3"
     assert dataset.schema.sha256 != old.sha256
     encode_motion(dataset[0]["states"], dataset.schema)
     assert index.read_bytes() == before
