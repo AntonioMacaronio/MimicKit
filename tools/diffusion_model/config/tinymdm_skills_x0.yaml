@@ -1,0 +1,45 @@
+# 0.30 s skill prior: carry, push (hands) and slide (feet), conditioned on the skill (class)
+# and the canonical box size. Train on the merged, mirrored carry + push/slide cache.
+# TF32 matmuls keep fp32 weights and run ~2.5x faster.
+# Needs a 16-state cache (the default --window-frames) from the carry and push/slide manifests.
+model_name: tiny_mdm
+arch_name: CondDiT  # Class = skill: carry 0, push 1, slide 2 (num_class set by the dataset).
+T: 50
+loss_type: l1
+estimate_mode: sample  # x0 prediction: stable 50-step DDPM sampling, less stall bias
+noise_schedule_mode: squaredcos_cap_v2
+num_layers: 10
+num_attention_heads: 10  # width 10 x 64 = 640; 69.5M parameters, 1.9x the 8 x 512 carry prior
+model_ema: true
+model_ema_decay: 0.995
+model_ema_steps: 10
+model_ema_update_after: 5000
+normalizer_std_clip: 0.03
+batch_size: 512
+lr: 0.0001
+num_iterations: 200000
+num_samples_stat: 20000
+output_iter: 2000
+grad_clip_norm: 1.0
+seed: 0
+dataset_type: hoi
+data_device: cuda  # Packed states reside here; encoding runs on the model device.
+dataset_index: ${SMP_SKILL_DATASET}
+quality_policy: all  # All selected segments; preserves pending-review metadata.
+window_stages: all  # Pre-contact, active and settle windows of every skill (a segment cache).
+# Drop windows touching a state flagged by these mimickit_smp.quality checks (needs a cache
+# prepared with quality flags). Grip type is never checked.
+quality_checks: [physical, chatter, foot_slide, support]
+# Draw a skill, then a stage within it, then a uniform window.
+stage_weights: {pickup: 0.2, lifted: 0.6, setdown: 0.2}  # Within each skill; for push/slide "lifted" = box moving
+# Skills in proportion to their kept windows (carry ~59%, push ~19%, slide ~22%). Equal draws
+# ({carry: 1, push: 1, slide: 1}) let the carry label accept push and slide motion.
+class_weights: null
+cfg_dropout: 0.0  # The skill is always known when scoring.
+# Schema v3 conditions on canonical box size (cond_dim 3, set by the dataset); not noised.
+env_config: tools/diffusion_model/config/carry_hoi_env.yaml
+validation_split: validation  # Held-out actors; logs fixed-noise denoising loss per stage.
+eval_windows: 4096  # Per split and stage (all, pickup, lifted, set-down).
+checkpoint_every: 20000
+control_freq: 50
+allow_tf32: true

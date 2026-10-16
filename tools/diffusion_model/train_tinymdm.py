@@ -33,8 +33,12 @@ def fixseed(seed):
 
 EVAL_STAGES = (None, "pickup", "lifted", "setdown")
 
+def uses_classes(config):
+    """Class-conditioned priors (CondDiT with num_class > 0) get a skill label per window."""
+    return config.get("arch_name") == "CondDiT" and config.get("num_class", 0) > 0
+
 def build_eval_sets(config, dataset_env, device):
-    """Fixed windows (all stages, then per stage) from the training and validation splits."""
+    """Fixed windows (all stages, then per stage, then per skill class) from the train and validation splits."""
     num = config.get("eval_windows", 0)
     if not num or not hasattr(dataset_env, "fixed_windows"):
         return {}
@@ -44,8 +48,11 @@ def build_eval_sets(config, dataset_env, device):
     sets = {}
     for name, env in envs.items():
         for k, stage in enumerate(EVAL_STAGES):
-            motion, cond = env.fixed_windows(num, seed=10_000 + k, stage=stage)
-            sets[f"{name}_{stage or 'all'}"] = (motion, cond)
+            sets[f"{name}_{stage or 'all'}"] = env.fixed_windows(num, seed=10_000 + k, stage=stage)
+        if uses_classes(config) and len(env.class_map) > 1:
+            for k, skill in enumerate(env.class_map):
+                if env.dataset.class_counts[skill]:
+                    sets[f"{name}_{skill}"] = env.fixed_windows(num, seed=20_000 + k, class_name=skill)
     return sets
 
 @torch.no_grad()
@@ -53,12 +60,14 @@ def eval_losses(model, sets, config, device, use_ema):
     """Denoising loss with fixed timesteps and noise, so values are comparable across iterations."""
     denoiser = model.ema_dmodel if use_ema else model.dmodel
     out = {}
-    for key, (windows, cond) in sets.items():
+    for key, (windows, cond, labels) in sets.items():
         x = model.normalize(windows.to(device).reshape(windows.shape[0], -1, config["input_channel"])).reshape(windows.shape[0], -1)
         generator = torch.Generator(device=device).manual_seed(77)
         t = torch.randint(0, len(model.diffusion_scheduler.timesteps), (x.shape[0],), device=device, generator=generator)
         noise = torch.randn(x.shape, device=device, generator=generator)
         kwargs = model._with_condition({"cond": cond.to(device)} if cond is not None else {})
+        if uses_classes(config):
+            kwargs["class_labels"] = labels.to(device)
         total = 0.0
         for i in range(0, x.shape[0], 4096):
             noised = model.diffusion_scheduler.add_noise(x[i:i + 4096], noise[i:i + 4096], t[i:i + 4096])
@@ -89,7 +98,10 @@ def generate(model, dataset, obs_space, config, device, out_motion_dir, enable_e
 
     # Conditional priors generate for box sizes drawn from the training windows.
     kwargs = {}
-    if config.get("cond_dim", 0):
+    if config.get("cond_dim", 0) and uses_classes(config):
+        cond, labels = dataset.sample_conditions(num_samples, return_class=True)
+        kwargs.update(cond=cond.to(device), class_labels=labels.to(device))
+    elif config.get("cond_dim", 0):
         kwargs["cond"] = dataset.sample_conditions(num_samples).to(device)
 
     if enable_ema:
@@ -137,6 +149,8 @@ def test(cfg_path, model_file, out_dir=None, num_samples=16, device="cuda"):
     config["input_dim"] = obs_space.shape[-1]
     config["input_channel"] = int(config["input_dim"] / num_obs_steps)
     config["cond_dim"] = getattr(dataset_env, "condition_dim", 0)
+    if config.get("arch_name") == "CondDiT":
+        config.setdefault("num_class", getattr(dataset_env, "num_class", 0))
 
     priormodel = TinyMDMModel(config, device)
     prior_state_dict = torch.load(model_file, map_location=device)
@@ -196,6 +210,9 @@ def train(cfg_path, out_dir=None, device="cuda"):
     # A continuous condition (HOI box size) is given to the denoiser without noise.
     cond_dim = getattr(dataset_env, "condition_dim", 0)
     config["cond_dim"] = cond_dim
+    if config.get("arch_name") == "CondDiT":
+        # One embedding per skill class of the cache (carry / push / slide).
+        config.setdefault("num_class", getattr(dataset_env, "num_class", 0))
 
     # Persist the resolved feature dimensions and HOI schema with the checkpoint.
     if hasattr(dataset_env, "schema"):
@@ -228,7 +245,10 @@ def train(cfg_path, out_dir=None, device="cuda"):
 
     while curr_iters < num_iters:
         batch_kwargs = {}
-        if cond_dim:
+        if cond_dim and uses_classes(config):
+            samples, labels, cond = dataset_env.fetch_obs_demo(batch_size, return_class=True, return_condition=True)
+            batch_kwargs.update(cond=cond.to(device), class_labels=labels.to(device))
+        elif cond_dim:
             samples, cond = dataset_env.fetch_obs_demo(batch_size, return_condition=True)
             batch_kwargs["cond"] = cond.to(device)
         else:

@@ -58,7 +58,27 @@ def main():
     if dataset.schema.sha256 != config["feature_schema_sha256"]:
         raise ValueError("The cache's feature schema differs from the prior's")
     width = dataset.schema.window_frames
-    pick = torch.from_numpy(np.random.default_rng(args.seed).choice(len(dataset), args.num, replace=False))
+    skilled = config.get("arch_name") == "CondDiT" and config.get("num_class", 0) > 0
+    rng = np.random.default_rng(args.seed)
+    if skilled:
+        # The same number of windows per skill present in the split.
+        present = [c for c in sorted(dataset.class_names) if (dataset.window_class_ids == c).any()]
+        per = args.num // len(present)
+        pick = np.concatenate(
+            [
+                rng.choice(
+                    np.flatnonzero(dataset.window_class_ids == c),
+                    min(per, int((dataset.window_class_ids == c).sum())),
+                    replace=False,
+                )
+                for c in present
+            ]
+        )
+        pick = torch.from_numpy(pick)
+        args.num = len(pick)
+    else:
+        pick = torch.from_numpy(rng.choice(len(dataset), args.num, replace=False))
+    labels = torch.from_numpy(dataset.window_class_ids[pick.numpy()])
     states = PackedWindowSampler(dataset).gather(pick)
     real, cond = encode_window(states.double(), dataset.schema)
     generated = []
@@ -68,6 +88,7 @@ def main():
         draws = []
         for i in range(0, args.num, args.batch):
             c = cond[i : i + args.batch].float().to(args.device)
+            extra = {"class_labels": labels[i : i + args.batch].to(args.device)} if skilled else {}
             sample = model.sample_ema(
                 shape=(width * 216,),
                 batch_size=len(c),
@@ -75,6 +96,7 @@ def main():
                 sampler=args.sampler,
                 num_inference_steps=args.steps,
                 cond=c,
+                **extra,
             )
             draws.append(model.unnormalize(sample.reshape(len(c), width, -1)).cpu())
         generated.append(torch.cat(draws))
@@ -85,6 +107,8 @@ def main():
         real_motion=real.float().numpy(),
         box_size=cond.float().numpy(),
         stage_ids=dataset.window_stage_ids[pick.numpy()],
+        class_ids=labels.numpy(),
+        class_names=np.asarray([dataset.class_names[c] for c in sorted(dataset.class_names)]),
         feature_schema_sha256=dataset.schema.sha256,
         index=str(index),
         model=str(args.model_dir / args.model_file),

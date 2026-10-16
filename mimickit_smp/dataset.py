@@ -5,7 +5,9 @@ also holds the pickup and set-down context; its windows may span those phases
 and stay in the same carry class. stages="lifted" keeps only fully lifted windows.
 quality_checks drops every window touching a state flagged by a selected check
 (mimickit_smp.quality); stage_weights draws pickup / lifted / set-down windows in
-fixed proportions instead of in proportion to their counts.
+fixed proportions instead of in proportion to their counts, and class_weights does
+the same for skill classes (carry / push / slide). For push and slide, "lifted"
+is the interval in which the box is moved along the floor.
 """
 
 import hashlib
@@ -33,6 +35,7 @@ class CarryWindowDataset(Dataset):
         stages="all",
         quality_checks=(),
         stage_weights=None,
+        class_weights=None,
         max_open_files=32,
     ):
         self.index_path = Path(index).resolve()
@@ -107,7 +110,22 @@ class CarryWindowDataset(Dataset):
             name: int((self.window_stage_ids == i).sum()) for i, name in enumerate(WINDOW_STAGES)
         }
         self.stage_weights = self._check_weights(stage_weights)
-        self._stage_members = [torch.from_numpy(np.flatnonzero(self.window_stage_ids == i)) for i in range(3)]
+        # Skill classes (carry/push/slide); single-class caches keep class 0 = carry.
+        self.class_map = dict(self.index.get("class_map", {"carry": 0}))
+        self.class_names = {i: name for name, i in self.class_map.items()}
+        segment_classes = np.asarray([s.get("class_id", 0) for s in self.segments], np.int64)
+        self.window_class_ids = segment_classes[self.window_segments]
+        self.class_counts = {
+            name: int((self.window_class_ids == i).sum()) for name, i in self.class_map.items()
+        }
+        self.class_weights = self._check_class_weights(class_weights)
+        self._groups = {
+            int(c): [
+                torch.from_numpy(np.flatnonzero((self.window_class_ids == c) & (self.window_stage_ids == k)))
+                for k in range(3)
+            ]
+            for c in np.unique(self.window_class_ids)
+        }
         self.index_sha256 = hashlib.sha256(self.index_path.read_bytes()).hexdigest()
 
     def _flags(self, segment):
@@ -135,18 +153,58 @@ class CarryWindowDataset(Dataset):
         total = sum(weights.values())
         return {name: weights.get(name, 0.0) / total for name in WINDOW_STAGES}
 
+    def _check_class_weights(self, weights):
+        if weights is None:
+            return None
+        weights = {name: float(w) for name, w in dict(weights).items()}
+        if (
+            set(weights) - set(self.class_map)
+            or any(w < 0 for w in weights.values())
+            or not sum(weights.values())
+        ):
+            raise ValueError(f"class_weights needs non-negative weights over {sorted(self.class_map)}")
+        empty = [name for name, w in weights.items() if w > 0 and not self.class_counts[name]]
+        if empty:
+            raise ValueError(f"class_weights select classes without windows: {empty}")
+        total = sum(weights.values())
+        return {name: weights.get(name, 0.0) / total for name in self.class_map}
+
     def sample_indices(self, num_samples, generator=None):
-        """Random window indices: uniform over windows, or over stages by stage_weights first."""
-        if self.stage_weights is None:
+        """Random window indices.
+
+        Uniform over windows without weights. Otherwise draw a class (class_weights,
+        or in proportion to its windows), then a stage within it (stage_weights, or
+        in proportion; stages a class lacks are skipped), then a uniform window.
+        """
+        if self.stage_weights is None and self.class_weights is None:
             return torch.randint(len(self), (num_samples,), generator=generator)
-        weights = torch.tensor([self.stage_weights[name] for name in WINDOW_STAGES], dtype=torch.float64)
-        stages = torch.multinomial(weights, num_samples, replacement=True, generator=generator)
+        classes = sorted(self._groups)
+
+        def class_weight(c):
+            if self.class_weights is None:
+                return float(sum(len(g) for g in self._groups[c]))
+            return self.class_weights[self.class_names[c]]
+
+        weights = torch.tensor([class_weight(c) for c in classes], dtype=torch.float64)
+        picks = torch.multinomial(weights, num_samples, replacement=True, generator=generator)
         indices = torch.empty(num_samples, dtype=torch.int64)
-        for i, members in enumerate(self._stage_members):
-            chosen = stages == i
-            count = int(chosen.sum())
-            if count:
-                indices[chosen] = members[torch.randint(len(members), (count,), generator=generator)]
+        for slot, c in enumerate(classes):
+            chosen = torch.nonzero(picks == slot, as_tuple=True)[0]
+            if not len(chosen):
+                continue
+            groups = self._groups[c]
+            stage = torch.tensor(
+                [
+                    0.0 if not len(g) else self.stage_weights[name] if self.stage_weights else float(len(g))
+                    for name, g in zip(WINDOW_STAGES, groups)
+                ],
+                dtype=torch.float64,
+            )
+            stages = torch.multinomial(stage, len(chosen), replacement=True, generator=generator)
+            for k, members in enumerate(groups):
+                rows = chosen[stages == k]
+                if len(rows):
+                    indices[rows] = members[torch.randint(len(members), (len(rows),), generator=generator)]
         return indices
 
     def __len__(self):
@@ -177,7 +235,7 @@ class CarryWindowDataset(Dataset):
         state = np.array(self._states(segment)[start : start + self.schema.window_frames], copy=True)
         return {
             "states": torch.from_numpy(state),
-            "class_id": 0,
+            "class_id": int(segment.get("class_id", 0)),
             "stage": self.window_stage(clip, start),
             "segment_index": clip,
             "trial_id": segment["trial_id"],

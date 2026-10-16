@@ -58,6 +58,14 @@ def metrics(decoded, model, data, body_ids, limits):
     hands = np.stack(
         [box_signed_distance(fk[:, :, k], box_pos, box_rot, extents) for k in (2, 3)], axis=-1
     ).min(-1)
+    foot_box = np.stack(
+        [box_signed_distance(fk[:, :, k], box_pos, box_rot, extents) for k in (0, 1)], axis=-1
+    ).min(-1)
+    # Floor skills: the box moves along the floor (push with hands, slide with feet).
+    box_speed = np.linalg.norm(np.diff(box_pos[..., :2], axis=1), axis=-1) * RATE
+    moving = np.r_["1", box_speed[:, :1], box_speed] > 0.10
+    touching = np.minimum(hands, foot_box) < 0.05
+    moving_windows = moving.any(1)
     feet = fk[:, :, :2]
     speed = np.linalg.norm(np.diff(feet[..., :2], axis=1), axis=-1) * RATE
     planted = (feet[:, 1:, :, 2] < 0.08) & (feet[:, :-1, :, 2] < 0.08)
@@ -87,6 +95,12 @@ def metrics(decoded, model, data, body_ids, limits):
         else float("nan"),
         "box_below_floor_frames": float((bottom < -0.02).mean()),
         "planted_foot_speed_m_s_p50_p95": q(speed[planted]),
+        "box_moving_frames": float(moving.mean()),
+        "hand_box_cm_p50_p95_when_moving": q(100 * hands[moving]),
+        "foot_box_cm_p50_p95_when_moving": q(100 * foot_box[moving]),
+        "moving_windows_without_contact": float((~(touching & moving).any(1))[moving_windows].mean())
+        if moving_windows.any()
+        else float("nan"),
     }
 
 
@@ -114,20 +128,32 @@ def main():
         "generated_per_size": int(s["generated_motion"].shape[1]) if s["generated_motion"].ndim == 4 else 1,
         "window_frames": schema.window_frames,
     }
+    classes = s["class_ids"] if "class_ids" in s.files else np.zeros(len(size), np.int64)
+    names = s["class_names"].tolist() if "class_names" in s.files else ["carry"]
     for name in ("real", "generated"):
         motion = torch.from_numpy(s[f"{name}_motion"]).double()
-        cond = size
+        cond, labels = size, classes
         if motion.dim() == 4:  # [windows, samples per size, frames, 216]
             cond = size.repeat_interleave(motion.shape[1], 0)
+            labels = np.repeat(classes, motion.shape[1])
             motion = motion.flatten(0, 1)
         decoded = decode_window(motion, cond, schema)
         report[name] = metrics(decoded, model, data, body_ids, limits)
+        # Per skill (carry / push / slide) when the samples carry class IDs.
+        if len(np.unique(labels)) > 1:
+            for c in np.unique(labels):
+                keep = torch.from_numpy(labels == c)
+                subset = {k: v[keep] for k, v in decoded.items()}
+                report[f"{name}_{names[c]}"] = metrics(subset, model, data, body_ids, limits)
     args.out.write_text(json.dumps(report, indent=2) + "\n")
     width = max(len(k) for k in report["real"])
-    print(f"{'metric':{width}s}  {'real':>22s}  {'generated':>22s}")
+    columns = ["real", "generated"] + sorted(
+        k for k, v in report.items() if isinstance(v, dict) and k.startswith(("real_", "generated_"))
+    )
+    fmt = lambda v: " / ".join(f"{x:.3g}" for x in v) if isinstance(v, list) else f"{v:.3g}"  # noqa: E731
+    print(f"{'metric':{width}s}  " + "  ".join(f"{c:>20s}" for c in columns))
     for k in report["real"]:
-        fmt = lambda v: " / ".join(f"{x:.3g}" for x in v) if isinstance(v, list) else f"{v:.3g}"  # noqa: E731
-        print(f"{k:{width}s}  {fmt(report['real'][k]):>22s}  {fmt(report['generated'][k]):>22s}")
+        print(f"{k:{width}s}  " + "  ".join(f"{fmt(report[c][k]):>20s}" for c in columns))
 
 
 if __name__ == "__main__":

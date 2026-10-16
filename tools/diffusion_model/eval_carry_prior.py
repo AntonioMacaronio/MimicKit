@@ -17,7 +17,15 @@ no forward kinematics is needed:
 - skate: the robot and box drift 1 m/s sideways together (feet slide);
 - root_jitter: the whole robot shakes frame to frame (1.5 cm, 2 deg);
 - splice: two windows joined at the middle, positions made continuous;
-- static: every frame equals the first (a statue; plausible during short pauses).
+- static: every frame equals the first (a statue; plausible during short pauses);
+- skill_swap (skill-conditioned priors): the real motion scored under another skill;
+  skill_matrix scores each skill's real windows under every other label.
+
+A skill-conditioned prior scores every window under its own skill label, draws the
+same number of windows per skill and reports each corruption per skill too. Per-skill
+numbers normalize by that skill's real windows, as a single-skill policy's running mean
+would, so a skill's numbers match a prior trained on that skill alone. A skill without
+windows in the split is listed as missing.
 
 It also scores real windows the training filter dropped, one quality check at a
 time (windows touching that check's flags and no other's), against clean ones:
@@ -58,6 +66,7 @@ CORRUPTIONS = (
     "root_jitter",
     "splice",
     "static",
+    "skill_swap",
 )
 
 
@@ -157,19 +166,36 @@ def corrupt(name, ctx, s, width, rng, other=None):
     raise ValueError(name)
 
 
-def draw(dataset, sampler, num, width, seed, stage=None):
-    """Window starts with two poses before and 2W poses from the start inside the segment."""
+def draw(dataset, sampler, num, width, seed, stage=None, class_ids=None, span=None):
+    """Window starts with two poses before and span poses (default 2W) from the start inside the segment.
+
+    Corruptions need 2W poses (2x speed); real windows only W, so stage scores pass
+    span=W and keep a segment's last windows (push and slide settle for only 0.5 s).
+    class_ids: draw num windows from each of these skill classes (that has any).
+    Returns contexts, segment indices, stage IDs and class IDs.
+    """
+    span = 2 * width if span is None else span
     frames = np.asarray([s["frames"] for s in dataset.segments])
     seg, start = dataset.window_segments, dataset.window_starts
-    ok = (start >= 2) & (start + 2 * width <= frames[seg])
+    ok = (start >= 2) & (start + span <= frames[seg])
     if stage is not None:
         ok &= dataset.window_stage_ids == WINDOW_STAGES.index(stage)
-    pool = np.flatnonzero(ok)
-    pick = np.random.default_rng(seed).choice(pool, size=min(num, len(pool)), replace=False)
+    rng = np.random.default_rng(seed)
+    groups = [ok] if class_ids is None else [ok & (dataset.window_class_ids == c) for c in class_ids]
+    picks = [rng.choice(np.flatnonzero(g), size=min(num, int(g.sum())), replace=False) for g in groups if g.any()]
+    if not picks:
+        empty = np.zeros(0, np.int64)
+        return np.zeros((0, span + 2, 70)), empty, empty, empty
+    pick = np.concatenate(picks)
     offsets = np.concatenate([[0], np.cumsum(frames)[:-1]])
     states = sampler.states.cpu().numpy()
-    ctx = [states[offsets[seg[i]] + start[i] - 2 : offsets[seg[i]] + start[i] + 2 * width] for i in pick]
-    return np.stack(ctx).astype(np.float64), seg[pick], dataset.window_stage_ids[pick]
+    ctx = [states[offsets[seg[i]] + start[i] - 2 : offsets[seg[i]] + start[i] + span] for i in pick]
+    return (
+        np.stack(ctx).astype(np.float64),
+        seg[pick],
+        dataset.window_stage_ids[pick],
+        dataset.window_class_ids[pick],
+    )
 
 
 @torch.no_grad()
@@ -195,15 +221,22 @@ def flagged_windows(index, split, width, num, seed):
         pool = np.flatnonzero(touched == bit)
         if len(pool) >= 32:
             pick = torch.from_numpy(rng.choice(pool, size=min(num, len(pool)), replace=False))
-            out[name] = sampler.gather(pick)
+            out[name] = (sampler.gather(pick), torch.from_numpy(everything.window_class_ids[pick.numpy()]))
     return out
 
 
-def sds(model, motion, cond, steps, draws, device):
+def sds(model, motion, cond, steps, draws, device, labels=None, cfg_scale=1.0):
+    """cfg_scale != 1 scores with the guided prediction uncond + s (cond - uncond) of a prior
+    trained with cfg_dropout; s = 0 ignores the skill label."""
     x = model.normalize(motion.to(device)).reshape(motion.shape[0], -1)
+    kwargs = (
+        {} if labels is None else {"class_labels": torch.as_tensor(labels, dtype=torch.long, device=device)}
+    )
+    if cfg_scale != 1.0:
+        kwargs["cfg_scale"] = cfg_scale
     total = 0
     for _ in range(draws):
-        total = total + model.ESM_SDS_loss(x, t_lst=steps, cond=cond.to(device))
+        total = total + model.ESM_SDS_loss(x, t_lst=steps, cond=cond.to(device), **kwargs)
     return (total / draws).cpu()
 
 
@@ -233,10 +266,18 @@ def main():
     parser.add_argument("--sds_loss_scale", type=float, default=6.0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--cfg_scale",
+        type=float,
+        default=1.0,
+        help="Guided SDS for priors trained with cfg_dropout: uncond + s (cond - uncond); 0 ignores the skill",
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
     config = yaml.safe_load((args.model_dir / "diffusion_config.yaml").read_text())
+    if args.cfg_scale != 1.0 and not config.get("cfg_dropout"):
+        raise ValueError("Guided scores need a prior trained with cfg_dropout > 0 (it learns the null label)")
     config["env_config"] = str(args.model_dir / "env_config.yaml")
     model = TinyMDMModel(config, args.device)
     model.load_state_dict(torch.load(args.model_dir / args.model_file, map_location=args.device))
@@ -252,19 +293,31 @@ def main():
     width = dataset.schema.window_frames
     sampler = PackedWindowSampler(dataset)
     rng = np.random.default_rng(args.seed)
+    skilled = config.get("arch_name") == "CondDiT" and config.get("num_class", 0) > 0
+    class_names = dataset.class_names
+    present = [c for c in sorted(class_names) if (dataset.window_class_ids == c).any()] if skilled else None
+    per_class = args.num // len(present) if skilled else args.num
 
-    def score(windows, cond=None, draws=args.draws):
+    def score(windows, cond=None, draws=args.draws, labels=None):
         states = torch.from_numpy(np.stack(windows)).float()
         motion, size = encode_window(states, dataset.schema)
-        return sds(model, motion, size if cond is None else cond, args.diffusion_steps, draws, args.device)
+        cond = size if cond is None else cond
+        return sds(
+            model, motion, cond, args.diffusion_steps, draws, args.device, labels if skilled else None, args.cfg_scale
+        )
 
-    ctx, segs, stages = draw(dataset, sampler, args.num, width, args.seed)
-    others, other_segs, _ = draw(dataset, sampler, args.num, width, args.seed + 1)
+    ctx, segs, stages, labels = draw(dataset, sampler, per_class, width, args.seed, class_ids=present)
+    others, other_segs, _, other_labels = draw(
+        dataset, sampler, per_class, width, args.seed + 1, class_ids=present
+    )
     lifted = stages == WINDOW_STAGES.index("lifted")
     real = [corrupt("real", c, 0, width, rng) for c in ctx]
     stored = ctx[:, 2 : 2 + width]
+    # Windows whose real box travels > 5 cm: pushes and kicks pause the box, and freezing a
+    # resting box changes nothing, so box corruptions are also scored on these alone.
+    moving_box = np.linalg.norm(stored[:, -1, 54:57] - stored[:, 0, 54:57], axis=-1) > 0.05
     velocity_error = float(np.abs(np.stack(real)[..., 48:67] - stored[..., 48:67]).max())
-    real_avg, real_one = score(real), score(real, draws=1)
+    real_avg, real_one = score(real, labels=labels), score(real, draws=1, labels=labels)
     mu_avg, mu_one = real_avg.mean(0), real_one.mean(0)
 
     def reward(losses, mu):
@@ -272,6 +325,19 @@ def main():
 
     def normalized(losses, mu):
         return (losses / mu).mean(-1).numpy()
+
+    skill_mask = {c: labels == c for c in present} if skilled else {}
+    skill_mu = {c: (real_avg[m].mean(0), real_one[m].mean(0)) for c, m in skill_mask.items()}
+
+    def skill_metrics(c, losses, losses_one):
+        m, (mu, mu1) = skill_mask[c], skill_mu[c]
+        mm = m & moving_box
+        return {
+            "auroc": auroc(normalized(real_avg[m], mu), normalized(losses[m], mu)),
+            "auroc_moving_box": auroc(normalized(real_avg[mm], mu), normalized(losses[mm], mu)) if mm.any() else None,
+            "auroc_single_draw": auroc(normalized(real_one[m], mu1), normalized(losses_one[m], mu1)),
+            "reward_ratio": float(reward(losses[m], mu).mean() / reward(real_avg[m], mu).mean()),
+        }
 
     report = {
         "model": str(args.model_dir / args.model_file),
@@ -281,25 +347,41 @@ def main():
         "window_seconds": (width - 1) / RATE,
         "diffusion_steps": args.diffusion_steps,
         "noise_draws_averaged": args.draws,
+        "cfg_scale": args.cfg_scale,
         "velocity_recompute_max_abs_error": velocity_error,
         "real_mean_sds_per_step": real_avg.mean(0).tolist(),
         "corruptions": {},
         "real_by_stage": {},
+        "skills": {class_names[c]: int((labels == c).sum()) for c in present} if skilled else None,
+        "moving_box_windows": {class_names[c]: int(((labels == c) & moving_box).sum()) for c in present}
+        if skilled
+        else int(moving_box.sum()),
+        "skills_missing_in_split": [n for c, n in class_names.items() if c not in present]
+        if skilled
+        else None,
     }
     real_norm, real_norm_one = normalized(real_avg, mu_avg), normalized(real_one, mu_one)
     for name in CORRUPTIONS:
-        windows, cond = [], None
+        if name == "skill_swap" and not (skilled and len(present) > 1):
+            continue
+        windows, cond, fake_labels = [], None, labels
         for i, c in enumerate(ctx):
             other = others[i] if other_segs[i] != segs[i] else others[(i + 1) % len(others)]
-            windows.append(corrupt(name, c, 0, width, rng, other))
+            windows.append(corrupt(name if name != "skill_swap" else "real", c, 0, width, rng, other))
         if name == "size_swap":
             _, sizes = encode_window(torch.from_numpy(np.stack(real)).float(), dataset.schema)
             cond = sizes[torch.from_numpy(np.random.default_rng(args.seed + 2).permutation(len(real)))]
-        losses, losses_one = score(windows, cond), score(windows, cond, draws=1)
+        if name == "skill_swap":
+            # Each window under the next skill present in the split.
+            nxt = {c: present[(k + 1) % len(present)] for k, c in enumerate(present)}
+            fake_labels = np.asarray([nxt[c] for c in labels])
+        losses = score(windows, cond, labels=fake_labels)
+        losses_one = score(windows, cond, draws=1, labels=fake_labels)
         fake_norm = normalized(losses, mu_avg)
         report["corruptions"][name] = {
             "auroc": auroc(real_norm, fake_norm),
             "auroc_lifted_windows": auroc(real_norm[lifted], fake_norm[lifted]),
+            "auroc_moving_box": auroc(real_norm[moving_box], fake_norm[moving_box]) if moving_box.any() else None,
             **{
                 f"auroc_step_{t}": auroc(
                     (real_avg[:, k] / mu_avg[k]).numpy(), (losses[:, k] / mu_avg[k]).numpy()
@@ -311,27 +393,106 @@ def main():
             "reward_ratio": float(reward(losses, mu_avg).mean() / reward(real_avg, mu_avg).mean()),
         }
         print(
-            f"{name:12s} " + " ".join(f"{k} {v:.3f}" for k, v in report["corruptions"][name].items()),
+            f"{name:12s} "
+            + " ".join(f"{k} {v:.3f}" for k, v in report["corruptions"][name].items() if v is not None),
             flush=True,
         )
+        if skilled:
+            report["corruptions"][name]["by_skill"] = {
+                class_names[c]: skill_metrics(c, losses, losses_one) for c in present
+            }
+            for skill, values in report["corruptions"][name]["by_skill"].items():
+                print(f"  {skill:6s} " + " ".join(f"{k} {v:.3f}" for k, v in values.items() if v is not None), flush=True)
+    if skilled and len(present) > 1:
+        # Every skill's real windows under every other label (skill_swap tries one other label).
+        report["skill_matrix"] = {class_names[c]: {} for c in present}
+        for j in present:
+            under_j = score(real, labels=np.full(len(real), j))
+            for c in present:
+                if c != j:
+                    m, mu = skill_mask[c], skill_mu[c][0]
+                    ml = m & lifted  # Push and slide: the box is moving.
+                    report["skill_matrix"][class_names[c]][class_names[j]] = {
+                        "auroc": auroc(normalized(real_avg[m], mu), normalized(under_j[m], mu)),
+                        "auroc_lifted_windows": auroc(normalized(real_avg[ml], mu), normalized(under_j[ml], mu)),
+                        "reward_ratio": float(reward(under_j[m], mu).mean() / reward(real_avg[m], mu).mean()),
+                    }
+        print("skill_matrix (real skill -> label: auroc)", json.dumps(
+            {i: {j: round(v["auroc"], 3) for j, v in row.items()} for i, row in report["skill_matrix"].items()}
+        ), flush=True)
     report["filtered_out_real"] = {}
-    for name, states in flagged_windows(index, args.split, width, args.num, args.seed + 4).items():
+    for name, (states, flagged_labels) in flagged_windows(
+        index, args.split, width, args.num, args.seed + 4
+    ).items():
         motion, size = encode_window(states, dataset.schema)
-        losses = sds(model, motion, size, args.diffusion_steps, args.draws, args.device)
+        losses = sds(
+            model,
+            motion,
+            size,
+            args.diffusion_steps,
+            args.draws,
+            args.device,
+            flagged_labels if skilled else None,
+            args.cfg_scale,
+        )
         fake_norm = normalized(losses, mu_avg)
         report["filtered_out_real"][name] = {
             "windows": len(states),
             "auroc": auroc(real_norm, fake_norm),
             "normalized_sds_ratio": float(fake_norm.mean() / real_norm.mean()),
         }
+        if skilled:
+            by_skill = {}
+            for c in present:
+                m = flagged_labels.numpy() == c
+                if m.sum() >= 32:
+                    mu = skill_mu[c][0]
+                    by_skill[class_names[c]] = {
+                        "windows": int(m.sum()),
+                        "auroc": auroc(normalized(real_avg[skill_mask[c]], mu), normalized(losses[m], mu)),
+                    }
         print(
             f"flagged {name:12s} "
             + " ".join(f"{k} {v:.3f}" for k, v in report["filtered_out_real"][name].items()),
             flush=True,
         )
+        if skilled:
+            report["filtered_out_real"][name]["by_skill"] = by_skill
+    if skilled:
+        report["real_by_skill"] = {
+            class_names[c]: {
+                "windows": int((labels == c).sum()),
+                "reward_ratio_vs_all_real": float(
+                    reward(real_avg[labels == c], mu_avg).mean() / reward(real_avg, mu_avg).mean()
+                ),
+            }
+            for c in present
+        }
+        # Within each skill (for push and slide: pickup = approach, lifted = box moving, setdown = settle).
+        report["real_by_skill_stage"] = {}
+        for c in present:
+            mu, entry = skill_mu[c][0], {}
+            for stage in WINDOW_STAGES:
+                stage_ctx, _, _, stage_labels = draw(
+                    dataset, sampler, args.num // 2, width, args.seed + 3, stage, class_ids=[c], span=width
+                )
+                if not len(stage_ctx):
+                    continue
+                losses = score([corrupt("real", x, 0, width, rng) for x in stage_ctx], labels=stage_labels)
+                entry[stage] = {
+                    "windows": len(stage_ctx),
+                    "reward_ratio_vs_skill_real": float(
+                        reward(losses, mu).mean() / reward(real_avg[skill_mask[c]], mu).mean()
+                    ),
+                }
+            report["real_by_skill_stage"][class_names[c]] = entry
     for stage in WINDOW_STAGES:
-        stage_ctx, _, _ = draw(dataset, sampler, args.num // 2, width, args.seed + 3, stage)
-        losses = score([corrupt("real", c, 0, width, rng) for c in stage_ctx])
+        stage_ctx, _, _, stage_labels = draw(
+            dataset, sampler, args.num // 2, width, args.seed + 3, stage, span=width
+        )
+        if not len(stage_ctx):
+            continue
+        losses = score([corrupt("real", c, 0, width, rng) for c in stage_ctx], labels=stage_labels)
         report["real_by_stage"][stage] = {
             "windows": len(stage_ctx),
             "normalized_sds_mean": float(normalized(losses, mu_avg).mean()),

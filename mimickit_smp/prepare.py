@@ -20,7 +20,10 @@ from . import quality
 from .features import KEY_BODIES, FeatureSchema
 
 # Source phases kept per policy: 0 pickup context, 1 lifted, 2 set-down context.
+# For push and slide, phase 1 is the interval in which the box is moved along the floor.
 WINDOW_POLICIES = {"lifted": (1,), "segment": (0, 1, 2)}
+# Skill classes; a segment's "skill" (default carry) sets its class_id.
+CLASS_MAP = {"carry": 0, "push": 1, "slide": 2}
 
 
 def file_hash(path):
@@ -215,8 +218,8 @@ def process_segment(segment, output, schema_dict, window_policy="lifted"):
                 "training_approval",
             )
         },
-        "class_id": 0,
-        "class_name": "carry",
+        "class_id": CLASS_MAP[segment.get("skill", "carry")],
+        "class_name": segment.get("skill", "carry"),
         "states": str(destination.relative_to(output)),
         "states_sha256": file_hash(destination),
         "quality_flags": str(flags_path.relative_to(output)),
@@ -244,16 +247,45 @@ def process_segment(segment, output, schema_dict, window_policy="lifted"):
     }
 
 
-def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16, window_policy="lifted"):
+def prepare(
+    manifest_path, output, workers=8, sample_rate=50.0, window_frames=16, window_policy="lifted", actor_splits=None
+):
+    """manifest_path: one manifest, or several (e.g. carry and push/slide) merged into one cache.
+
+    actor_splits: optional JSON file with an "actor_splits" map (e.g. a skill manifest
+    whose actors were re-split); segments of the listed actors take its split in every
+    input manifest. The copied source manifests keep their own splits.
+    """
     import mujoco
 
     if window_policy not in WINDOW_POLICIES:
         raise ValueError(f"window_policy must be one of {sorted(WINDOW_POLICIES)}")
-    manifest_path, output = Path(manifest_path).resolve(), Path(output).resolve()
-    manifest = json.loads(manifest_path.read_text())
-    if manifest["status"] != "complete":
+    paths = [
+        Path(p).resolve()
+        for p in ([manifest_path] if isinstance(manifest_path, (str, Path)) else manifest_path)
+    ]
+    output = Path(output).resolve()
+    manifests = [json.loads(p.read_text()) for p in paths]
+    if any(m["status"] != "complete" for m in manifests):
         raise ValueError("Source export is incomplete")
-    segments = manifest["segments"]
+    segments = [s for m in manifests for s in m["segments"]]
+    overrides, moved = {}, Counter()
+    if actor_splits is not None:
+        overrides = json.loads(Path(actor_splits).read_text())["actor_splits"]
+        moved = Counter(
+            f"{s['actor_id']}: {s['split']} -> {overrides[s['actor_id']]}"
+            for s in segments
+            if overrides.get(s["actor_id"], s["split"]) != s["split"]
+        )
+        segments = [dict(s, split=overrides.get(s["actor_id"], s["split"])) for s in segments]
+    unknown = {s.get("skill", "carry") for s in segments} - set(CLASS_MAP)
+    if unknown:
+        raise ValueError(f"Unknown skills {sorted(unknown)}; expected {sorted(CLASS_MAP)}")
+    manifest = (
+        manifests[0]
+        if len(manifests) == 1
+        else {"merged_manifests": [str(p) for p in paths], "manifests": manifests}
+    )
     if not segments or len({s["trial_id"] for s in segments}) != len(segments):
         raise ValueError("Empty selection or duplicate IDs")
     actors = {}
@@ -261,7 +293,7 @@ def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16
         if s["split"] not in ("train", "validation", "test"):
             raise ValueError("Unrecognized source split")
         if actors.setdefault(s["actor_id"], s["split"]) != s["split"]:
-            raise ValueError("Actor leakage in source manifest")
+            raise ValueError("Actor leakage across splits in the source manifests")
     with np.load(segments[0]["trajectory"], allow_pickle=False) as d:
         skeleton = robot_xml(str(d["scene_xml"]))
         names = tuple(d["joint_names"].tolist())
@@ -307,8 +339,18 @@ def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16
         "status": "complete" if not failures else "incomplete",
         "feature_schema": schema.to_dict(),
         "feature_schema_sha256": schema.sha256,
-        "source_manifest_sha256": file_hash(manifest_path),
-        "class_map": {"carry": 0},
+        "source_manifest_sha256": file_hash(paths[0]) if len(paths) == 1 else [file_hash(p) for p in paths],
+        "actor_split_overrides": None
+        if actor_splits is None
+        else {
+            "path": str(Path(actor_splits).resolve()),
+            "sha256": file_hash(actor_splits),
+            "moved_segments": dict(sorted(moved.items())),
+        },
+        # Multi-skill caches always carry the full map so the class embedding has a fixed size.
+        "class_map": dict(CLASS_MAP)
+        if len(paths) > 1 or any(s.get("skill", "carry") != "carry" for s in segments)
+        else {"carry": 0},
         "window_policy": window_policy,
         "sampling": "uniform_valid_window_starts",
         "quality_policy": "all_selected_flags_preserved",
@@ -323,6 +365,7 @@ def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16
         "segments": results,
         "failures": failures,
         "summary": {
+            "skill_segments": dict(Counter(s["class_name"] for s in results)),
             "segments": len(results),
             "states": sum(s["frames"] for s in results),
             "windows": sum(s["valid_windows"] for s in results),
@@ -351,8 +394,15 @@ def prepare(manifest_path, output, workers=8, sample_rate=50.0, window_frames=16
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--manifest", type=Path, nargs="+", required=True, help="One or more smp_manifest.json files"
+    )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--actor-splits",
+        type=Path,
+        help="JSON with an actor_splits map (e.g. a skill manifest); listed actors take its split",
+    )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--sample-rate", type=float, default=50.0)
     parser.add_argument("--window-frames", type=int, default=16)
@@ -366,7 +416,13 @@ def main():
     if not 1 <= args.workers <= 32:
         parser.error("Use 1 to 32 workers")
     prepare(
-        args.manifest, args.output, args.workers, args.sample_rate, args.window_frames, args.window_policy
+        args.manifest,
+        args.output,
+        args.workers,
+        args.sample_rate,
+        args.window_frames,
+        args.window_policy,
+        args.actor_splits,
     )
 
 

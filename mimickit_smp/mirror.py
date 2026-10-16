@@ -204,6 +204,8 @@ def mirror_cache(index_path, output, check_segments=40):
     for key in ("segments", "states", "windows", "lifted_windows"):
         summary[key] = 2 * summary[key]
     summary["split_segments"] = {k: 2 * v for k, v in summary["split_segments"].items()}
+    if "skill_segments" in summary:
+        summary["skill_segments"] = {k: 2 * v for k, v in summary["skill_segments"].items()}
     if "quality_flagged_states" in summary:
         summary["quality_flagged_states"] = {k: 2 * v for k, v in summary["quality_flagged_states"].items()}
     mirrored_index["summary"] = summary

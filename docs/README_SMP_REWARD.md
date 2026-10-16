@@ -3,7 +3,8 @@
 This branch adds a portable `mimickit_smp` package and an object-aware dataset
 adapter for the existing TinyMDM trainer. Runtime data/features require NumPy and
 PyTorch, with no FAR-Holosoma or simulator imports. MuJoCo and SciPy are optional
-offline-preparation dependencies. The initial class is `carry` (`class_id=0`);
+offline-preparation dependencies. Classes are skills: `carry` (`class_id=0`),
+`push` (1) and `slide` (2), see [Skills](#skills-carry-push-and-slide-2026-10-11);
 the data comes from human mocap retargeted to G1, so the prior models **G1–box**
 interaction rather than SMPL-X poses.
 
@@ -444,5 +445,130 @@ The large epsilon prior is the most box-aware and kinematically consistent but
 keeps the strongest static preference. All priors still reward static windows
 more than real carrying (2–3× for large x0), so RL needs a task reward that
 outweighs stalling, or a speed-baselined SDS.
+
+### Skills: carry, push and slide (2026-10-11)
+
+Push and slide come from HiPHI's `Cause_motion` recordings, sorted by FrameNet
+lexical unit (FAR-Holosoma `projectpivot/experiments/hiphi_umr_dataset/skills.py`):
+**push** is push/shove/thrust/move, the hands moving a box along the floor;
+**slide** is punt/hit with a foot named in the annotation, kicks. Dragging a lug
+is not a push. `select_skill_segments.py` keeps stretches in which the box stays
+on the floor and moves faster than 8 cm/s, joining pauses of up to 3 s (shoves and
+kicks pause the box for 1.4–3.4 s), with at least 1 s of movement and 30 cm of
+travel. Push needs a hand within 10 cm of the box in at least half the moving
+frames; slide needs a foot there at least briefly and the hands mostly away. The
+moving interval is stored as the lift interval, so for push and slide the stages
+read **pickup = approach** (1.25 s), **lifted = box moving** and **setdown =
+settle** (0.5 s). The selection holds 386 segments from 214 recordings: push 219
+(1.39 h) and slide 167 (1.43 h). Run:
+`/data/sky/projects/FAR-Holosoma/runs/hiphi_umr_pushslide_20261011_v1`.
+
+Every actor has one split across skills, so no held-out actor's motion reaches
+training through another skill. Push and slide come almost entirely from carry
+training actors (A048 and A005 give 82% of slide), so `align_actor_splits.py
+--validation-actors` moved seven small actors to validation in every skill: A002,
+A003, A004, A026, A037, A043 and A127. The carry test set is unchanged; 8.6 min of
+carry moved from training to validation, applied to the carry segments by
+`prepare --actor-splits <push/slide manifest>`. Held out: push 11.3 min of
+validation and 0.7 min of test (A040), slide 8.8 min of validation and no test.
+
+The box-size augmentation repeats carry's seven UMR runs per recording (original
+size and six random per-axis factors in 0.7–1.3, the floor lift,
+`temporal_smooth_cost` 5) with a contact recipe per skill
+(`hiphi_umr_size_aug/prepare_full.py`):
+
+- push keeps UMR's box-contact weight 5 on the hands. At carry's 15 the hands sank
+  more than 3 cm into the pushed face on 22–27% of frames (5: none), and at 5 they
+  still touch resized boxes whenever the person's hands touch the box (six
+  recordings, three sizes each: `hiphi_umr_push_handweight_test_20261011`);
+- slide puts weight 15 on the feet (`ankle_roll`): the robot's foot is within 3 cm
+  of the box on 86–100% of the frames in which the person's foot touches it,
+  resized boxes included.
+
+All 1,498 + 819 solves converged (runs `hiphi_umr_pushslide_size_aug_20261011_v1`,
+whose push the hand-weight-5 run `hiphi_umr_push_size_aug_20261011_v2` replaces).
+
+Caches `hiphi_umr_skills_aug7_50hz_w38_v2` (0.74 s) and `hiphi_umr_skills_aug7_50hz_v2`
+(0.30 s), with `_mirror_` versions for training; `class_map` carry 0, push 1, slide 2:
+
+| Skill | Segments (train / val / test) | Hours | Training windows (0.74 s) kept by the four checks |
+| --- | ---: | ---: | ---: |
+| carry | 4,821 / 343 / 294 | 35.5 | 4.04 M (83%) |
+| push | 1,246 / 252 / 35 | 9.7 | 1.28 M (88%; 69% at hand weight 15) |
+| slide | 1,036 / 133 / 0 | 10.0 | 1.53 M (97%) |
+
+The skill prior (`tinymdm_skills_x0_w38.yaml`, 0.30 s: `tinymdm_skills_x0.yaml`) is a
+`CondDiT` with the skill as its class label (AdaLN, like the timestep) and the box
+size through the zero-initialized condition MLP. It is twice the large carry prior:
+10 layers × 640 wide, 69.5M parameters, x0 prediction. Training draws a skill in
+proportion to its kept windows (`class_weights: null`; the sweep below started with
+equal draws, 1:1:1), then a stage within it (0.2 / 0.6 / 0.2), then a window.
+
+Evaluation of skill-conditioned priors:
+
+- `eval_carry_prior.py` reports each corruption per skill (`by_skill`), normalized
+  by that skill's real windows as a single-skill policy's running mean would, and
+  adds `skill_swap` (real motion scored under another skill's label) and stage
+  ratios within each skill (`real_by_skill_stage`). Stage scores now use every
+  window of a stage; corruptions still need 2W poses after the window start (2×
+  speed). This moved the 0.74 s carry prior's set-down ratio from 0.150 to 0.217
+  and nothing else;
+- `evaluate_carry_prior_run.sh <run> <gpu> <index> [splits...]` evaluates several
+  splits; `EVAL_DIR` keeps a re-evaluation apart (the carry-only priors' are in
+  `eval_20261011/`);
+- `compare_carry_priors.py --split validation --skill push` tabulates one skill;
+  `--evals` names evaluation folders;
+- carry comparisons score skill priors on the carry-only cache, the same windows
+  the carry-only priors were scored on;
+- `view_prior_samples.py` labels columns with skill and box size and has a Skill
+  menu; several `--samples` files (one per prior, drawn from the same held-out
+  windows) share one viewer through a Prior menu.
+
+Results at 0.74 s (runs `/data/sky/projects/MimicKit/runs/skill_prior_v2_mirror_*_20261011`,
+tables in `skill_compare_20261011/`). Carry is scored on the carry-only cache, the
+windows the carry-only prior was scored on; push and slide on validation actors.
+"Labeled X" scores a skill's real windows under skill X's label:
+
+| | carry-only 36M | skill 36M | skill 2× | skill 4× | 36M prop. | 2× prop. |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| carry test: AUROC frozen box / swapped size | 0.78 / 0.64 | 0.72 / 0.61 | 0.76 / 0.62 | 0.76 / 0.62 | 0.74 / 0.62 | 0.75 / 0.62 |
+| carry test: reward × pickup / lifted / set-down | 1.1 / 1.0 / 0.22 | 4.1 / 0.65 / 2.2 | 3.8 / 0.68 / 2.0 | 2.5 / 0.85 / 1.0 | 2.9 / 0.78 / 1.4 | 2.6 / 0.82 / 0.63 |
+| carry validation: reward × pickup / set-down | 0.06 / 0.017 | 1.05 / 0.23 | 0.58 / 0.11 | 0.29 / 0.056 | 0.43 / 0.081 | 0.20 / 0.047 |
+| carry: reward × static, test / validation | 2.8 / 1.8 | 3.3 / 3.1 | 3.9 / 3.1 | 4.1 / 2.7 | 3.4 / 2.7 | 3.7 / 2.4 |
+| carry test samples: hands off lifted box | 7.0% | 9.9% | 9.2% | 6.9% | 9.4% | 7.5% |
+| push: AUROC frozen box (box moving) / swapped size | | 0.62 / 0.67 | 0.61 / 0.66 | 0.56 / 0.66 | 0.62 / 0.66 | 0.61 / 0.66 |
+| slide: AUROC frozen box (box moving) / box +15 cm | | 0.49 / 0.70 | 0.51 / 0.66 | 0.50 / 0.64 | 0.48 / 0.66 | 0.49 / 0.66 |
+| AUROC push labeled carry / slide labeled carry | | 0.50 / 0.35 | 0.50 / 0.40 | 0.47 / 0.34 | 0.78 / 0.63 | 0.78 / 0.73 |
+| AUROC slide labeled push / push labeled slide | | 0.85 / 0.88 | 0.90 / 0.88 | 0.86 / 0.83 | 0.65 / 0.85 | 0.74 / 0.85 |
+
+- The seed replicate of the 2× prior differs by up to ±0.04 in AUROC and ±0.2 in
+  stage ratios. Push and slide numbers barely move with size (36M, 2×, 4×).
+- With equal skill draws the carry label accepts push and slide motion (slide
+  scores 2.2× higher labeled carry). Drawing skills in proportion to their windows
+  (carry 59%) makes it specific, at some cost in telling slide from push; the 2×
+  prior keeps more of that than the 36M one.
+- Push and slide raise the reward of carry's floor phases (pickup, set-down)
+  relative to the lift, by 3–20× against the carry-only prior. On the test actors
+  this overshoots parity, on the validation actors it approaches it. Each split
+  has only three carry actors, and the ratios differ more between the splits than
+  between priors. Proportional draws and larger models move them back toward the
+  carry-only prior.
+- No prior notices a kicked box that fails to move (slide frozen box ≈ 0.5, also on
+  windows whose box travels > 5 cm); push gets 0.6. Generated windows move the box
+  less often than real ones (push 26–30% of frames against 36%, slide 10% against
+  19%), while hand–box and foot–box distances match the real ones.
+- Every skill prior rewards static windows more than the carry-only prior does.
+- 400k iterations raise the validation loss (0.105 → 0.112) without improving the
+  benchmark: 200k is enough.
+- Label dropout (`cfg_dropout` 0.15) makes the conditional score nearly ignore the
+  label (push labeled slide 0.88 → 0.56). Guided scores (`eval_carry_prior.py
+  --cfg_scale`, uncond + s (cond − uncond)) recover part of it at s = 3 (0.75) but
+  let the carry label accept push and slide more, and do not change box awareness.
+- At 0.30 s the pattern repeats; proportional draws fix the carry label there too
+  (push / slide labeled carry 0.53 / 0.41 → 0.78 / 0.68).
+
+The current candidate is the 2× prior with proportional draws at 0.74 s,
+`skill_prior_v2_mirror_2x_x0_w38_propskills_20261011` (the repository configs now
+draw skills proportionally). A 4× prior with proportional draws was still training.
 
 Tests: `python -m pytest tests/smp_reward` (set its cache directory under `/data`).
